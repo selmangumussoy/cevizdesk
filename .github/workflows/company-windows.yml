@@ -175,6 +175,10 @@ jobs:
           python3 .\build.py --portable --hwcodec --flutter --vram --skip-portable-pack
           mv ./flutter/build/windows/x64/runner/Release ./rustdesk
 
+          # Ic ikili rustdesk.exe adiyla kaliyor; kurulum/servis <APP>.exe bekliyor.
+          # Her ikisi de bulunsun diye <APP>.exe kopyasini pakete ekle (rename degil, kopya).
+          Copy-Item ./rustdesk/rustdesk.exe "./rustdesk/$env:APP_NAME.exe" -Force
+
           Invoke-WebRequest -Uri https://github.com/rustdesk-org/rdev/releases/download/usbmmidd_v2/usbmmidd_v2.zip -OutFile usbmmidd_v2.zip
           Expand-Archive usbmmidd_v2.zip -DestinationPath .
           Remove-Item -Path usbmmidd_v2\Win32 -Recurse
