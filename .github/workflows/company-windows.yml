@@ -1,0 +1,252 @@
+# Sirket markali Windows istemcisi derlemesi.
+# Fork'ta .github/workflows/company-windows.yml olarak kaydedin.
+#
+# Upstream dosyalarina dokunmaz: kaynaklar derlemeden hemen once
+# branding/rebrand.py ile yamalanir, bu yuzden upstream merge'lerinde cakisma olmaz.
+# Arac surumleri (Flutter, LLVM, vcpkg, Rust) upstream flutter-build.yml'den okunur.
+#
+# Gerekli ayarlar (Settings > Secrets and variables > Actions):
+#   Secrets  : RENDEZVOUS_SERVER, RS_PUB_KEY
+#   Variables: APP_NAME (bosluksuz, orn. AcmeDesk), COMPANY_NAME
+#   Istege bagli variables: WEBSITE_URL, PRIVACY_URL
+#   Istege bagli imzalama secrets: WINDOWS_CERT_PFX_BASE64, WINDOWS_CERT_PASSWORD
+# Dosyalar: branding/rebrand.py, branding/icon.png (kare, 1024px), branding/logo.png (istege bagli)
+
+name: Company Windows build
+
+on:
+  workflow_dispatch:
+    inputs:
+      release:
+        description: "GitHub Release olustur (private repoda onerilir)"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+jobs:
+  versions:
+    runs-on: ubuntu-latest
+    outputs:
+      flutter: ${{ steps.v.outputs.FLUTTER_VERSION }}
+      llvm: ${{ steps.v.outputs.LLVM_VERSION }}
+      rust: ${{ steps.v.outputs.SCITER_RUST_VERSION }}
+      vcpkg: ${{ steps.v.outputs.VCPKG_COMMIT_ID }}
+      version: ${{ steps.v.outputs.VERSION }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: v
+        shell: bash
+        run: |
+          set -euo pipefail
+          for k in FLUTTER_VERSION LLVM_VERSION SCITER_RUST_VERSION VCPKG_COMMIT_ID; do
+            v=$(grep -m1 -E "^  $k: " .github/workflows/flutter-build.yml | sed -E 's/^[^:]+: *"?([^"#]*)"?.*$/\1/' | xargs)
+            [ -n "$v" ] || { echo "$k flutter-build.yml icinde bulunamadi"; exit 1; }
+            echo "$k=$v" >> "$GITHUB_OUTPUT"; echo "$k=$v"
+          done
+          v=$(grep -m1 -E '^version = ' Cargo.toml | sed -E 's/.*"(.*)".*/\1/')
+          echo "VERSION=$v" >> "$GITHUB_OUTPUT"; echo "VERSION=$v"
+
+  check-branding:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - name: Rebrand desenlerini dogrula (upstream degismis mi?)
+        env:
+          APP_NAME: ${{ vars.APP_NAME }}
+          COMPANY_NAME: ${{ vars.COMPANY_NAME }}
+        run: python3 branding/rebrand.py --repo . --app-name "$APP_NAME" --company "$COMPANY_NAME" --check
+
+  generate-bridge:
+    needs: check-branding
+    uses: ./.github/workflows/bridge.yml
+
+  build-RustDeskTempTopMostWindow:
+    needs: check-branding
+    uses: ./.github/workflows/third-party-RustDeskTempTopMostWindow.yml
+    with:
+      upload-artifact: true
+      target: windows-2022
+      configuration: Release
+      platform: x64
+      target_version: Windows10
+
+  build-windows:
+    needs: [versions, generate-bridge, build-RustDeskTempTopMostWindow]
+    runs-on: windows-2022
+    env:
+      APP_NAME: ${{ vars.APP_NAME }}
+      VERSION: ${{ needs.versions.outputs.version }}
+      FLUTTER_VERSION: ${{ needs.versions.outputs.flutter }}
+      HAS_CERT: ${{ secrets.WINDOWS_CERT_PFX_BASE64 != '' }}
+      VCPKG_BINARY_SOURCES: "clear;x-gha,readwrite"
+    steps:
+      - name: Export GitHub Actions cache environment variables
+        uses: actions/github-script@v6
+        with:
+          script: |
+            core.exportVariable('ACTIONS_CACHE_URL', process.env.ACTIONS_CACHE_URL || '');
+            core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
+
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Restore bridge files
+        uses: actions/download-artifact@v4
+        with:
+          name: bridge-artifact
+          path: ./
+
+      # ---- Markalama: secret'lar sadece bu adimda kullanilir, repoya yazilmaz ----
+      - name: Apply company branding
+        shell: bash
+        env:
+          RENDEZVOUS_SERVER: ${{ secrets.RENDEZVOUS_SERVER }}
+          RS_PUB_KEY: ${{ secrets.RS_PUB_KEY }}
+          COMPANY_NAME: ${{ vars.COMPANY_NAME }}
+          WEBSITE_URL: ${{ vars.WEBSITE_URL }}
+          PRIVACY_URL: ${{ vars.PRIVACY_URL }}
+        run: |
+          set -euo pipefail
+          pip3 install pillow
+          args=(--repo . --app-name "$APP_NAME" --company "$COMPANY_NAME" --icon branding/icon.png)
+          [ -f branding/logo.png ] && args+=(--logo branding/logo.png)
+          [ -n "$WEBSITE_URL" ] && args+=(--website "$WEBSITE_URL")
+          [ -n "$PRIVACY_URL" ] && args+=(--privacy-url "$PRIVACY_URL")
+          python3 branding/rebrand.py "${args[@]}"
+
+      - name: Install LLVM and Clang
+        uses: KyleMayes/install-llvm-action@v1
+        with:
+          version: ${{ needs.versions.outputs.llvm }}
+
+      - name: Install flutter
+        uses: subosito/flutter-action@v2.12.0
+        with:
+          channel: "stable"
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+
+      - name: Replace engine with rustdesk custom flutter engine
+        run: |
+          flutter doctor -v
+          flutter precache --windows
+          Invoke-WebRequest -Uri https://github.com/rustdesk/engine/releases/download/main/windows-x64-release.zip -OutFile windows-x64-release.zip
+          Expand-Archive -Path windows-x64-release.zip -DestinationPath windows-x64-release
+          mv -Force windows-x64-release/*  C:/hostedtoolcache/windows/flutter/stable-${{ env.FLUTTER_VERSION }}-x64/bin/cache/artifacts/engine/windows-x64-release/
+
+      - name: Patch flutter
+        shell: bash
+        run: |
+          cp .github/patches/flutter_3.24.4_dropdown_menu_enableFilter.diff $(dirname $(dirname $(which flutter)))
+          cd $(dirname $(dirname $(which flutter)))
+          if [[ "3.24.5" == "${{ env.FLUTTER_VERSION }}" ]]; then git apply flutter_3.24.4_dropdown_menu_enableFilter.diff; fi
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: ${{ needs.versions.outputs.rust }}
+          targets: x86_64-pc-windows-msvc
+          components: "rustfmt"
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: windows-2022
+
+      - name: Setup vcpkg with Github Actions binary cache
+        uses: lukka/run-vcpkg@v11
+        with:
+          vcpkgDirectory: C:\vcpkg
+          vcpkgGitCommitId: ${{ needs.versions.outputs.vcpkg }}
+          doNotCache: false
+
+      - name: Install vcpkg dependencies
+        shell: bash
+        env:
+          VCPKG_DEFAULT_HOST_TRIPLET: x64-windows-static
+        run: |
+          $VCPKG_ROOT/vcpkg install --triplet x64-windows-static --x-install-root="$VCPKG_ROOT/installed"
+
+      - name: Build
+        run: |
+          python3 .\build.py --portable --hwcodec --flutter --vram --skip-portable-pack
+          mv ./flutter/build/windows/x64/runner/Release ./rustdesk
+
+          Invoke-WebRequest -Uri https://github.com/rustdesk-org/rdev/releases/download/usbmmidd_v2/usbmmidd_v2.zip -OutFile usbmmidd_v2.zip
+          Expand-Archive usbmmidd_v2.zip -DestinationPath .
+          Remove-Item -Path usbmmidd_v2\Win32 -Recurse
+          Remove-Item -Path "usbmmidd_v2\deviceinstaller64.exe", "usbmmidd_v2\deviceinstaller.exe", "usbmmidd_v2\usbmmidd.bat"
+          mv -Force .\usbmmidd_v2 ./rustdesk
+
+      - name: Copy Runner.res for the portable packer
+        continue-on-error: true
+        shell: bash
+        run: |
+          runner_res=$(find . -name "Runner.res" | head -1)
+          [ -n "$runner_res" ] && cp "$runner_res" ./libs/portable/Runner.res
+
+      - name: Download RustDeskTempTopMostWindow artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: topmostwindow-artifacts
+          path: "./rustdesk"
+
+      # ---- Kod imzalama (secret tanimli degilse atlanir) ----
+      - name: Sign binaries
+        if: env.HAS_CERT == 'true'
+        env:
+          CERT_B64: ${{ secrets.WINDOWS_CERT_PFX_BASE64 }}
+          CERT_PASSWORD: ${{ secrets.WINDOWS_CERT_PASSWORD }}
+        run: |
+          $pfx = Join-Path $env:RUNNER_TEMP 'cert.pfx'
+          [IO.File]::WriteAllBytes($pfx, [Convert]::FromBase64String($env:CERT_B64))
+          $signtool = Get-ChildItem 'C:\Program Files (x86)\Windows Kits\10\bin\*\x64\signtool.exe' | Sort-Object FullName | Select-Object -Last 1
+          $files = Get-ChildItem ./rustdesk -Recurse -Include *.exe,*.dll | Where-Object { -not (Get-AuthenticodeSignature $_.FullName).SignerCertificate }
+          foreach ($f in $files) {
+            & $signtool.FullName sign /f $pfx /p $env:CERT_PASSWORD /fd SHA256 /tr http://timestamp.digicert.com /td SHA256 $f.FullName
+            if ($LASTEXITCODE -ne 0) { throw "signtool failed: $($f.FullName)" }
+          }
+          Remove-Item $pfx
+
+      - name: Build self-extracting installer
+        shell: bash
+        run: |
+          sed -i '/dpiAware/d' res/manifest.xml
+          pushd ./libs/portable
+          pip3 install -r requirements.txt
+          python3 ./generate.py -f ../../rustdesk/ -o . -e ../../rustdesk/rustdesk.exe
+          popd
+          mkdir -p ./SignOutput
+          mv ./target/release/rustdesk-portable-packer.exe "./SignOutput/${APP_NAME}-${VERSION}-x86_64.exe"
+
+      - name: Sign installer
+        if: env.HAS_CERT == 'true'
+        env:
+          CERT_B64: ${{ secrets.WINDOWS_CERT_PFX_BASE64 }}
+          CERT_PASSWORD: ${{ secrets.WINDOWS_CERT_PASSWORD }}
+        run: |
+          $pfx = Join-Path $env:RUNNER_TEMP 'cert.pfx'
+          [IO.File]::WriteAllBytes($pfx, [Convert]::FromBase64String($env:CERT_B64))
+          $signtool = Get-ChildItem 'C:\Program Files (x86)\Windows Kits\10\bin\*\x64\signtool.exe' | Sort-Object FullName | Select-Object -Last 1
+          Get-ChildItem ./SignOutput/*.exe | ForEach-Object {
+            & $signtool.FullName sign /f $pfx /p $env:CERT_PASSWORD /fd SHA256 /tr http://timestamp.digicert.com /td SHA256 $_.FullName
+            if ($LASTEXITCODE -ne 0) { throw "signtool failed: $($_.FullName)" }
+          }
+          Remove-Item $pfx
+
+      - name: Upload installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.APP_NAME }}-${{ env.VERSION }}-windows-x86_64
+          path: ./SignOutput/*.exe
+
+      - name: Publish Release
+        if: inputs.release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.APP_NAME }}-${{ env.VERSION }}
+          prerelease: true
+          files: ./SignOutput/*.exe
