@@ -120,6 +120,35 @@ def make_logo(repo: Path, logo_png: Path, check_only: bool):
         im.save(repo / "flutter/assets/logo.png", "PNG")
 
 
+def make_android_icons(repo: Path, icon_png: Path, check_only: bool):
+    """Android baslatici ikonlarini (legacy + round + adaptive foreground) uretir.
+    Arka plan rengi (ic_launcher_background) zaten beyaz oldugu icin dokunulmaz."""
+    if check_only:
+        return
+    from PIL import Image, ImageDraw
+    src = Image.open(icon_png).convert("RGBA")
+    base = repo / "flutter/android/app/src/main/res"
+    # Legacy kare + yuvarlak ikon (API < 26 ve roundIcon icin)
+    legacy = {"mdpi": 48, "hdpi": 72, "xhdpi": 96, "xxhdpi": 144, "xxxhdpi": 192}
+    for d, sz in legacy.items():
+        out = src.resize((sz, sz), Image.LANCZOS)
+        out.save(base / f"mipmap-{d}/ic_launcher.png", "PNG")
+        mask = Image.new("L", (sz, sz), 0)
+        ImageDraw.Draw(mask).ellipse((0, 0, sz - 1, sz - 1), fill=255)
+        rnd = out.copy()
+        rnd.putalpha(mask)
+        rnd.save(base / f"mipmap-{d}/ic_launcher_round.png", "PNG")
+    # Adaptive icon foreground: amblem ~%62 guvenli alanda ortalanir, cevresi seffaf.
+    fg = {"mdpi": 108, "hdpi": 162, "xhdpi": 216, "xxhdpi": 324, "xxxhdpi": 432}
+    for d, sz in fg.items():
+        canvas = Image.new("RGBA", (sz, sz), (0, 0, 0, 0))
+        inner = int(sz * 0.62)
+        mark = src.resize((inner, inner), Image.LANCZOS)
+        off = (sz - inner) // 2
+        canvas.paste(mark, (off, off), mark)
+        canvas.save(base / f"mipmap-{d}/ic_launcher_foreground.png", "PNG")
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--repo", default=".", help="RustDesk kaynak klasoru (varsayilan: .)")
@@ -176,6 +205,16 @@ def main():
     p.sub("flutter/lib/desktop/widgets/tabbar_widget.dart",
           r'(offstage: !showTitle,\s*child: const Text\(\s*)"[^"]*"', rf'\g<1>"{app}"', 1)
 
+    # 4b) Android: baslatici/servis adi (manifest) ve uygulama adi + erisim aciklamasi (strings)
+    manifest = "flutter/android/app/src/main/AndroidManifest.xml"
+    p.sub(manifest, r'(android:label=)"RustDesk"', rf'\g<1>"{app}"', 1)
+    p.sub(manifest, r'(android:label=)"RustDesk Input"', rf'\g<1>"{app} Input"', 1)
+    strings = "flutter/android/app/src/main/res/values/strings.xml"
+    p.sub(strings, r'(<string name="app_name">)RustDesk(</string>)', rf'\g<1>{app}\g<2>', 1)
+    p.sub(strings,
+          r'(<string name="accessibility_service_description">[^<]*?)RustDesk([^<]*</string>)',
+          rf'\g<1>{app}\g<2>', 1)
+
     # 5) Istege bagli baglantilar
     if args.privacy_url:
         for f in ("flutter/lib/desktop/pages/desktop_setting_page.dart",
@@ -189,6 +228,8 @@ def main():
     if args.icon:
         make_icons(repo, args.icon, args.check)
         p.changed.append("res/*.ico, res/*.png, flutter/windows/runner/resources/app_icon.ico, flutter/assets/icon.png")
+        make_android_icons(repo, args.icon, args.check)
+        p.changed.append("flutter/android/app/src/main/res/mipmap-*/ic_launcher*.png")
     if args.logo:
         make_logo(repo, args.logo, args.check)
         p.changed.append("flutter/assets/logo.png")

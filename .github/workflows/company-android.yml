@@ -1,0 +1,258 @@
+# Sirket markali Android (x86_64) istemcisi derlemesi — Bliss OS / Android x86_64 icin.
+# Fork'ta .github/workflows/company-android.yml olarak kaydedin.
+#
+# Upstream dosyalarina dokunmaz: kaynaklar derlemeden once branding/rebrand.py ile
+# yamalanir (uygulama adi, gomulu sunucu/key, Android ad/ikon). Arac surumleri
+# (Flutter, NDK, Rust, cargo-ndk, vcpkg) upstream flutter-build.yml'den okunur.
+#
+# Gerekli ayarlar (Settings > Secrets and variables > Actions):
+#   Secrets  : RENDEZVOUS_SERVER, RS_PUB_KEY
+#   Variables: APP_NAME (bosluksuz, orn. CevizDesk), COMPANY_NAME
+#   Istege bagli imzalama secrets (yoksa APK debug-imzali uretilir, yine kurulur):
+#     ANDROID_SIGNING_KEY (keystore'un base64 hali), ANDROID_ALIAS,
+#     ANDROID_KEY_STORE_PASSWORD, ANDROID_KEY_PASSWORD
+# Dosyalar: branding/rebrand.py, branding/icon.png (kare, 1024px)
+#
+# Cikti: <APP>-<surum>-x86_64.apk  (imzali ise -signed son eki)
+
+name: Company Android build
+
+on:
+  workflow_dispatch:
+    inputs:
+      release:
+        description: "GitHub Release olustur"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+jobs:
+  versions:
+    runs-on: ubuntu-latest
+    outputs:
+      flutter: ${{ steps.v.outputs.ANDROID_FLUTTER_VERSION }}
+      ndk: ${{ steps.v.outputs.NDK_VERSION }}
+      rust: ${{ steps.v.outputs.RUST_VERSION }}
+      cargo_ndk: ${{ steps.v.outputs.CARGO_NDK_VERSION }}
+      vcpkg: ${{ steps.v.outputs.VCPKG_COMMIT_ID }}
+      version: ${{ steps.v.outputs.VERSION }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: v
+        shell: bash
+        run: |
+          set -euo pipefail
+          for k in ANDROID_FLUTTER_VERSION NDK_VERSION RUST_VERSION CARGO_NDK_VERSION VCPKG_COMMIT_ID; do
+            v=$(grep -m1 -E "^  $k: " .github/workflows/flutter-build.yml | sed -E 's/^[^:]+: *"?([^"#]*)"?.*$/\1/' | xargs)
+            [ -n "$v" ] || { echo "$k flutter-build.yml icinde bulunamadi"; exit 1; }
+            echo "$k=$v" >> "$GITHUB_OUTPUT"; echo "$k=$v"
+          done
+          v=$(grep -m1 -E '^version = ' Cargo.toml | sed -E 's/.*"(.*)".*/\1/')
+          echo "VERSION=$v" >> "$GITHUB_OUTPUT"; echo "VERSION=$v"
+
+  check-branding:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - name: Rebrand desenlerini dogrula (upstream degismis mi?)
+        env:
+          APP_NAME: ${{ vars.APP_NAME }}
+          COMPANY_NAME: ${{ vars.COMPANY_NAME }}
+        run: python3 branding/rebrand.py --repo . --app-name "$APP_NAME" --company "$COMPANY_NAME" --check
+
+  generate-bridge:
+    needs: check-branding
+    uses: ./.github/workflows/bridge.yml
+
+  build-android:
+    needs: [versions, generate-bridge]
+    runs-on: ubuntu-24.04
+    env:
+      APP_NAME: ${{ vars.APP_NAME }}
+      VERSION: ${{ needs.versions.outputs.version }}
+      ANDROID_FLUTTER_VERSION: ${{ needs.versions.outputs.flutter }}
+      NDK_VERSION: ${{ needs.versions.outputs.ndk }}
+      RUST_VERSION: ${{ needs.versions.outputs.rust }}
+      CARGO_NDK_VERSION: ${{ needs.versions.outputs.cargo_ndk }}
+      VCPKG_COMMIT_ID: ${{ needs.versions.outputs.vcpkg }}
+      ANDROID_SIGNING_KEY: ${{ secrets.ANDROID_SIGNING_KEY }}
+      VCPKG_BINARY_SOURCES: "clear;x-gha,readwrite"
+    steps:
+      - name: Free Disk Space (Ubuntu)
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: false
+          android: false
+          dotnet: true
+          haskell: true
+          large-packages: false
+          docker-images: true
+          swap-storage: false
+
+      - name: Export GitHub Actions cache environment variables
+        uses: actions/github-script@v6
+        with:
+          script: |
+            core.exportVariable('ACTIONS_CACHE_URL', process.env.ACTIONS_CACHE_URL || '');
+            core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
+
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      # ---- Markalama: config.rs/manifest/strings/ikonlar derlemeden ONCE yamalanir ----
+      - name: Apply company branding
+        shell: bash
+        env:
+          RENDEZVOUS_SERVER: ${{ secrets.RENDEZVOUS_SERVER }}
+          RS_PUB_KEY: ${{ secrets.RS_PUB_KEY }}
+          COMPANY_NAME: ${{ vars.COMPANY_NAME }}
+        run: |
+          set -euo pipefail
+          pip3 install pillow
+          python3 branding/rebrand.py --repo . --app-name "$APP_NAME" --company "$COMPANY_NAME" --icon branding/icon.png
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+               clang cmake curl gcc-multilib git g++ g++-multilib \
+               libayatana-appindicator3-dev libasound2-dev libc6-dev libclang-dev \
+               libunwind-dev libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
+               libgtk-3-dev libpam0g-dev libpulse-dev libva-dev libxcb-randr0-dev \
+               libxcb-shape0-dev libxcb-xfixes0-dev libxdo-dev libxfixes-dev \
+               llvm-dev nasm ninja-build openjdk-17-jdk-headless pkg-config tree wget
+
+      - name: Install flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: "stable"
+          flutter-version: ${{ env.ANDROID_FLUTTER_VERSION }}
+
+      - name: Patch flutter
+        run: |
+          cd $(dirname $(dirname $(which flutter)))
+          if [[ "3.24.5" == "${{ env.ANDROID_FLUTTER_VERSION }}" ]]; then
+            git apply ${{ github.workspace }}/.github/patches/flutter_3.24.4_dropdown_menu_enableFilter.diff
+          fi
+
+      - uses: nttld/setup-ndk@v1
+        id: setup-ndk
+        with:
+          ndk-version: ${{ env.NDK_VERSION }}
+          add-to-path: true
+
+      - name: Setup vcpkg with Github Actions binary cache
+        uses: lukka/run-vcpkg@v11
+        with:
+          vcpkgDirectory: /opt/artifacts/vcpkg
+          vcpkgGitCommitId: ${{ env.VCPKG_COMMIT_ID }}
+          doNotCache: false
+
+      - name: Install vcpkg dependencies (x86_64)
+        shell: bash
+        run: |
+          if ! ./flutter/build_android_deps.sh "x86_64"; then
+            find "${VCPKG_ROOT}/" -name "*.log" | while read -r _1; do
+              echo "$_1:"; echo "======"; cat "$_1"; echo "======"; echo ""
+            done
+            exit 1
+          fi
+
+      - name: Restore bridge files
+        uses: actions/download-artifact@v4
+        with:
+          name: bridge-artifact
+          path: ./
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+          components: "rustfmt"
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: rustdesk-lib-cache-android
+          key: x86_64-linux-android
+
+      - name: Build rustdesk lib (x86_64)
+        env:
+          ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+          ANDROID_NDK_ROOT: ${{ steps.setup-ndk.outputs.ndk-path }}
+        run: |
+          rustup target add x86_64-linux-android
+          cargo install cargo-ndk --version ${{ env.CARGO_NDK_VERSION }} --locked
+          ./flutter/ndk_x64.sh
+          mkdir -p ./flutter/android/app/src/main/jniLibs/x86_64
+          cp ./target/x86_64-linux-android/release/liblibrustdesk.so ./flutter/android/app/src/main/jniLibs/x86_64/librustdesk.so
+
+      - name: Build rustdesk apk (x86_64)
+        shell: bash
+        env:
+          JAVA_HOME: /usr/lib/jvm/java-17-openjdk-amd64
+          ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+        run: |
+          export PATH=/usr/lib/jvm/java-17-openjdk-amd64/bin:$PATH
+          # Gradle JVM bellegini artir
+          sed -i "s/org.gradle.jvmargs=-Xmx1024M/org.gradle.jvmargs=-Xmx2g/g" ./flutter/android/gradle.properties
+          # Gecici: gradle derlemesi keystore istemesin (imzalama sonradan r0adkll ile)
+          sed -i "s/signingConfigs.release/signingConfigs.debug/g" ./flutter/android/app/build.gradle
+          mkdir -p ./flutter/android/app/src/main/jniLibs/x86_64
+          cp ${ANDROID_NDK_HOME}/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/x86_64-linux-android/libc++_shared.so ./flutter/android/app/src/main/jniLibs/x86_64/
+          cp ./target/x86_64-linux-android/release/liblibrustdesk.so ./flutter/android/app/src/main/jniLibs/x86_64/librustdesk.so
+          pushd flutter
+          flutter build apk --release --target-platform android-x64 --split-per-abi
+          mv build/app/outputs/flutter-apk/app-x86_64-release.apk "../${APP_NAME}-${VERSION}-x86_64.apk"
+          popd
+          mkdir -p signed-apk
+          mv "./${APP_NAME}-${VERSION}-x86_64.apk" signed-apk/
+
+      - name: Setup sign tool version variable
+        shell: bash
+        run: |
+          BUILD_TOOL_VERSION=$(ls /usr/local/lib/android/sdk/build-tools/ | tail -n 1)
+          echo "ANDROID_SIGN_TOOL_VERSION=$BUILD_TOOL_VERSION" >> $GITHUB_ENV
+          echo "Son build-tools surumu: $BUILD_TOOL_VERSION"
+
+      - name: Sign app APK
+        if: env.ANDROID_SIGNING_KEY != null
+        uses: r0adkll/sign-android-release@v1
+        with:
+          releaseDirectory: ./signed-apk
+          signingKeyBase64: ${{ secrets.ANDROID_SIGNING_KEY }}
+          alias: ${{ secrets.ANDROID_ALIAS }}
+          keyStorePassword: ${{ secrets.ANDROID_KEY_STORE_PASSWORD }}
+          keyPassword: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        env:
+          BUILD_TOOLS_VERSION: ${{ env.ANDROID_SIGN_TOOL_VERSION }}
+
+      - name: Prepare final apk
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          if ls ./signed-apk/*-signed.apk >/dev/null 2>&1; then
+            cp ./signed-apk/*-signed.apk "out/${APP_NAME}-${VERSION}-x86_64-signed.apk"
+          else
+            cp "./signed-apk/${APP_NAME}-${VERSION}-x86_64.apk" "out/${APP_NAME}-${VERSION}-x86_64.apk"
+          fi
+          ls -la out
+
+      - name: Upload apk
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.APP_NAME }}-${{ env.VERSION }}-android-x86_64
+          path: ./out/*.apk
+
+      - name: Publish Release
+        if: inputs.release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.APP_NAME }}-${{ env.VERSION }}-android
+          prerelease: true
+          files: ./out/*.apk
